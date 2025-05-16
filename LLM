@@ -1,0 +1,430 @@
+from langchain.chat_models import AzureChatOpenAI
+from langchain.embeddings import AzureOpenAIEmbeddings
+import os
+from dotenv import load_dotenv
+import requests
+from typing import List, Dict, Any, Optional
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQAWithSourcesChain
+from langchain.docstore.document import Document
+from langchain.prompts import PromptTemplate
+from abc import ABC, abstractmethod
+import numpy as np
+from numpy.linalg import norm
+
+# Load environment variables
+load_dotenv()
+
+# Azure OpenAI configurations
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+
+
+class LLMModel:
+    """Base class for language models"""
+    
+    def _init_(self, model_name: str):
+        self.model_name = model_name
+        self._model = self._initialize_model()
+    
+    @abstractmethod
+    def _initialize_model(self):
+        """Initialize the language model"""
+        pass
+    
+    @property
+    def model(self):
+        """Get the initialized model"""
+        return self._model
+
+
+class AzureOpenAIModel(LLMModel):
+    """Azure OpenAI model implementation"""
+    
+    def _init_(self, model_name: str, deployment_name: str, api_version: str):
+        self.deployment_name = deployment_name
+        self.api_version = api_version
+        super()._init_(model_name)
+    
+    def _initialize_model(self):
+        """Initialize Azure OpenAI model"""
+        return AzureChatOpenAI(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            openai_api_key=AZURE_OPENAI_API_KEY,
+            openai_api_version=self.api_version,
+            azure_deployment=self.deployment_name,
+            openai_api_type="azure",
+        )
+
+
+class EmbeddingModel:
+    """Base class for embedding models"""
+    
+    def _init_(self, model_name: str):
+        self.model_name = model_name
+        self._model = self._initialize_model()
+    
+    @abstractmethod
+    def _initialize_model(self):
+        """Initialize the embedding model"""
+        pass
+    
+    @property
+    def model(self):
+        """Get the initialized model"""
+        return self._model
+    
+    def embed_query(self, query: str) -> List[float]:
+        """Embed a query string"""
+        return self._model.embed_query(query)
+    
+    def embed_documents(self, documents: List[str]) -> List[List[float]]:
+        """Embed a list of documents"""
+        return self._model.embed_documents(documents)
+
+
+class AzureOpenAIEmbeddingModel(EmbeddingModel):
+    """Azure OpenAI embedding model implementation"""
+    
+    def _init_(self, model_name: str, deployment_name: str, api_version: str):
+        self.deployment_name = deployment_name
+        self.api_version = api_version
+        super()._init_(model_name)
+    
+    def _initialize_model(self):
+        """Initialize Azure OpenAI embedding model"""
+        return AzureOpenAIEmbeddings(
+            azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            openai_api_key=AZURE_OPENAI_API_KEY,
+            openai_api_version=self.api_version,
+            azure_deployment=self.deployment_name,
+        )
+
+
+class DocumentLoader(ABC):
+    """Abstract base class for document loaders"""
+    
+    @abstractmethod
+    def load(self, source: str) -> Document:
+        """Load a document from a source"""
+        pass
+
+
+class WebDocumentLoader(DocumentLoader):
+    """Loader for web documents"""
+    
+    def load(self, source: str) -> Document:
+        """Load a document from a web URL"""
+        try:
+            response = requests.get(source)
+            return Document(
+                page_content=response.text,
+                metadata={"source": source}
+            )
+        except Exception as e:
+            raise ValueError(f"Error loading document from {source}: {e}")
+
+
+class PDFDocumentLoader(DocumentLoader):
+    """Loader for PDF documents"""
+    
+    def load(self, source: str) -> Document:
+        """Load a document from a PDF URL"""
+        try:
+            # In a real implementation, use PyPDF2 or similar
+            # This is a simplified version for the assignment
+            response = requests.get(source)
+            # Placeholder for actual PDF parsing
+            text = f"Content from PDF at {source}"
+            return Document(
+                page_content=text,
+                metadata={"source": source}
+            )
+        except Exception as e:
+            raise ValueError(f"Error loading PDF from {source}: {e}")
+
+
+class DocumentLoaderFactory:
+    """Factory for creating document loaders"""
+    
+    @staticmethod
+    def create_loader(source: str) -> DocumentLoader:
+        """Create a loader based on the source type"""
+        if source.endswith('.pdf'):
+            return PDFDocumentLoader()
+        else:
+            return WebDocumentLoader()
+
+
+class DocumentProcessor:
+    """Class for processing documents"""
+    
+    def _init_(self, chunk_size: int = 1000, chunk_overlap: int = 200):
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap
+        )
+    
+    def chunk_document(self, document: Document) -> List[Document]:
+        """Split a document into chunks"""
+        chunks = self.text_splitter.split_text(document.page_content)
+        chunked_docs = []
+        
+        for i, chunk in enumerate(chunks):
+            chunked_doc = Document(
+                page_content=chunk,
+                metadata={
+                    **document.metadata,
+                    "chunk_id": i
+                }
+            )
+            chunked_docs.append(chunked_doc)
+        
+        return chunked_docs
+
+
+class VectorStore(ABC):
+    """Abstract base class for vector stores"""
+    
+    def _init_(self, embedding_model: EmbeddingModel):
+        self.embedding_model = embedding_model
+        self._store = None
+    
+    @abstractmethod
+    def index_documents(self, documents: List[Document]) -> None:
+        """Index documents in the vector store"""
+        pass
+    
+    @abstractmethod
+    def search(self, query: str, k: int = 5) -> List[Document]:
+        """Search for similar documents"""
+        pass
+
+
+class FAISSVectorStore(VectorStore):
+    """FAISS implementation of vector store"""
+    
+    def index_documents(self, documents: List[Document]) -> None:
+        """Index documents using FAISS"""
+        self._store = FAISS.from_documents(
+            documents, 
+            self.embedding_model.model
+        )
+    
+    def search(self, query: str, k: int = 5) -> List[Document]:
+        """Search for similar documents using FAISS"""
+        if self._store is None:
+            raise ValueError("Vector store not initialized. Call index_documents first.")
+        
+        return self._store.similarity_search(query, k=k)
+    
+    @property
+    def as_retriever(self):
+        """Get the store as a retriever"""
+        if self._store is None:
+            raise ValueError("Vector store not initialized. Call index_documents first.")
+        
+        return self._store.as_retriever()
+
+
+class ScoringStrategy(ABC):
+    """Abstract base class for scoring strategies"""
+    
+    @abstractmethod
+    def score(self, query: str, document: Document, embedding_model: EmbeddingModel) -> float:
+        """Score a document based on relevance to query"""
+        pass
+
+
+class CosineSimilarityScorer(ScoringStrategy):
+    """Cosine similarity scoring strategy"""
+    
+    def score(self, query: str, document: Document, embedding_model: EmbeddingModel) -> float:
+        """Calculate cosine similarity between query and document"""
+        query_embedding = embedding_model.embed_query(query)
+        doc_embedding = embedding_model.embed_documents([document.page_content])[0]
+        
+        # Calculate cosine similarity
+        dot_product = np.dot(query_embedding, doc_embedding)
+        query_norm = norm(query_embedding)
+        doc_norm = norm(doc_embedding)
+        
+        similarity = dot_product / (query_norm * doc_norm)
+        return float(similarity)
+
+
+class DocumentRetriever:
+    """Class for document retrieval operations"""
+    
+    def _init_(self, vector_store: VectorStore):
+        self.vector_store = vector_store
+    
+    def retrieve(self, query: str, top_k: int = 5) -> List[Document]:
+        """Retrieve relevant documents for a query"""
+        return self.vector_store.search(query, k=top_k)
+
+
+class DocumentScorer:
+    """Class for scoring retrieved documents"""
+    
+    def _init_(self, scoring_strategy: ScoringStrategy, embedding_model: EmbeddingModel):
+        self.scoring_strategy = scoring_strategy
+        self.embedding_model = embedding_model
+    
+    def score_documents(self, query: str, documents: List[Document]) -> List[Dict[str, Any]]:
+        """Score a list of documents based on relevance to query"""
+        scored_docs = []
+        
+        for doc in documents:
+            score = self.scoring_strategy.score(query, doc, self.embedding_model)
+            
+            scored_doc = {
+                "document": doc,
+                "score": score,
+                "source": doc.metadata.get("source", "Unknown"),
+                "chunk_id": doc.metadata.get("chunk_id", -1)
+            }
+            
+            scored_docs.append(scored_doc)
+        
+        # Sort by score in descending order
+        return sorted(scored_docs, key=lambda x: x["score"], reverse=True)
+
+
+class AnswerGenerator:
+    """Class for generating answers from retrieved documents"""
+    
+    def _init_(self, llm_model: LLMModel, vector_store: VectorStore):
+        self.llm_model = llm_model
+        self.vector_store = vector_store
+    
+    def generate(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Generate an answer for a query"""
+        qa_prompt_template = """
+        Answer the question based on the following context:
+        
+        {context}
+        
+        Question: {question}
+        """
+        
+        qa_prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template=qa_prompt_template
+        )
+        
+        qa_chain = RetrievalQAWithSourcesChain.from_chain_type(
+            llm=self.llm_model.model,
+            chain_type="stuff",
+            retriever=self.vector_store.as_retriever(search_kwargs={"k": top_k}),
+            return_source_documents=True,
+            chain_type_kwargs={"prompt": qa_prompt}
+        )
+        
+        return qa_chain({"question": query})
+
+
+class RAGPipeline:
+    """Main RAG Pipeline class that orchestrates the entire process"""
+    
+    def _init_(self):
+        # Initialize models
+        self.llm_model = AzureOpenAIModel(
+            model_name="gpt-4",
+            deployment_name="gpt-4o",
+            api_version="2025-01-01-preview"
+        )
+        
+        self.embedding_model = AzureOpenAIEmbeddingModel(
+            model_name="text-embedding-ada",
+            deployment_name="text-embedding-ada-002",
+            api_version="2023-05-15"
+        )
+        
+        # Initialize vector store
+        self.vector_store = FAISSVectorStore(self.embedding_model)
+        
+        # Initialize components
+        self.document_processor = DocumentProcessor()
+        self.retriever = DocumentRetriever(self.vector_store)
+        self.scorer = DocumentScorer(CosineSimilarityScorer(), self.embedding_model)
+        self.answer_generator = AnswerGenerator(self.llm_model, self.vector_store)
+    
+    def process_documents(self, document_urls: List[str]) -> None:
+        """Process documents: load, chunk, and index"""
+        all_chunked_docs = []
+        
+        for url in document_urls:
+            # Create appropriate loader
+            loader = DocumentLoaderFactory.create_loader(url)
+            
+            # Load document
+            document = loader.load(url)
+            
+            # Chunk document
+            chunked_docs = self.document_processor.chunk_document(document)
+            all_chunked_docs.extend(chunked_docs)
+        
+        # Index all chunked documents
+        self.vector_store.index_documents(all_chunked_docs)
+    
+    def retrieve_and_score(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve relevant documents for a query and score them"""
+        # Retrieve documents
+        relevant_docs = self.retriever.retrieve(query, top_k=top_k)
+        
+        # Score documents
+        scored_docs = self.scorer.score_documents(query, relevant_docs)
+        
+        return scored_docs[:top_k]
+    
+    def generate_answer(self, query: str, top_k: int = 5) -> Dict[str, Any]:
+        """Generate an answer for a query using the RAG pipeline"""
+        # Get scored documents
+        scored_docs = self.retrieve_and_score(query, top_k)
+        
+        # Generate answer
+        answer = self.answer_generator.generate(query, top_k)
+        
+        # Add scored documents to the answer
+        answer["scored_documents"] = scored_docs
+        
+        return answer
+
+
+# Usage example
+def main():
+    # Initialize RAG pipeline
+    rag_pipeline = RAGPipeline()
+    
+    # Example document URLs
+    document_urls = [
+        "https://www.langchain.com/langsmith"
+        # Add more URLs as needed
+    ]
+    
+    # Process documents
+    rag_pipeline.process_documents(document_urls)
+    
+    # Example queries from the assignment
+    queries = [
+        "Why is the periodic income measurement necessary?",
+        "How does limited liability encourage entrepreneurship?",
+        "What are the key components of a langsmith?",
+        "What are Retrieval Challenges in RAG?",
+        "What is the difference between RAG and Fine-tuning?"
+    ]
+    
+    # Generate answers for each query
+    for query in queries:
+        print(f"\nQuery: {query}")
+        result = rag_pipeline.generate_answer(query)
+        print(f"Answer: {result['answer']}")
+        print("Sources:")
+        for doc in result['scored_documents'][:3]:  # Show top 3 sources
+            print(f"- {doc['source']} (Score: {doc['score']:.4f})")
+
+
+if _name_ == "_main_":
+    main()
